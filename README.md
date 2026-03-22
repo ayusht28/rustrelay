@@ -1,583 +1,445 @@
 # RustRelay
 
-A real-time message routing and presence system built in Rust — inspired by Discord's
-decision to rewrite their Read States service from Go to Rust.
-
-This isn't a toy project. It mirrors the actual architecture behind Discord's real-time
-infrastructure and solves the exact same problems they faced at scale.
+**A real-time messaging backend built in Rust — modeled after the system Discord rebuilt when Go couldn't keep up.**
 
 ---
 
-## Why does this project exist?
+## The story behind this project
 
-Discord's engineering team had a service written in Go that tracked which messages each
-user had read. It worked fine most of the time, but every ~2 minutes Go's garbage collector
-would freeze the entire service to clean up memory. At Discord's scale (millions of users),
-those freezes caused latency spikes that affected everyone.
+Discord runs one of the largest real-time messaging platforms on the planet. Millions of users, billions of messages. One of their most critical services — the one that tracks which messages you've read — was originally written in Go.
 
-They rewrote the service in Rust. The result: zero GC pauses, lower memory usage, better
-tail latency, fewer servers needed.
+It worked. Mostly.
 
-This project recreates that architecture. It solves 7 specific problems:
+The problem was Go's garbage collector. Every couple of minutes, Go would stop everything to clean up unused memory. During that pause, messages would pile up, users would see delays, and the whole system would hiccup. Discord tried tuning it. They tried workarounds. Nothing fixed the fundamental issue: Go pauses to clean up, and you can't turn that off.
 
-| # | Problem | Our solution | File |
-|---|---------|-------------|------|
-| 1 | Go's GC freezes all messages every ~2 min | Rust has no GC — memory freed instantly via ownership | Entire codebase |
-| 2 | Thousands of users fighting for one lock | DashMap (64 shards) + mpsc channels per session | `gateway/session.rs` |
-| 3 | Database query on every single message | Channel member cache with 5-min TTL | `router/fanout.rs` |
-| 4 | Presence flickers when phone loses signal | 5-second debounced offline detection | `presence/tracker.rs` |
-| 5 | One status change notifies 50,000 users | Batched + de-duplicated presence broadcasts | `presence/broadcast.rs` |
-| 6 | Millions of read-state writes per second | In-memory buffer with periodic bulk flush | `readstate/cache.rs` |
-| 7 | Dead connections wasting memory forever | Heartbeat monitor reaps stale sessions | `gateway/heartbeat.rs` |
+So they rewrote it in Rust. Rust doesn't have a garbage collector. Memory gets freed the moment it's no longer needed — the compiler figures this out before the code even runs. The result was dramatic. Latency dropped. The hiccups disappeared. They needed fewer servers to handle the same load.
+
+This project is my attempt to rebuild that system from scratch. Not just the read-state service they rewrote, but the full real-time backend: WebSocket connections, message delivery, presence tracking, and the read-state buffering system that started it all.
 
 ---
 
-## What's inside
+## What problems does this solve?
 
-**WebSocket Gateway** — Users connect over WebSockets. Each user can be on multiple
-devices (phone + laptop) at the same time. The gateway authenticates them, manages their
-sessions, and handles heartbeats to detect dead connections.
+I didn't build this just to write Rust code. Each part of the system exists because there's a real engineering problem behind it.
 
-**Message Router** — When someone sends a message, the router saves it to PostgreSQL,
-looks up who's in that channel (cached), and delivers it to every recipient's WebSocket.
-If a recipient is on a different server, it publishes to Redis for cross-node delivery.
+### 1. Garbage collection freezes everything
 
-**Presence Tracker** — Tracks who's online, idle, or offline. Uses a 5-second debounce
-so that brief disconnections (phone going through a tunnel) don't cause flickering. Batches
-presence updates to avoid overwhelming the system when many users change status at once.
+In Go, the GC pauses the entire server every ~2 minutes to scan and free memory. At scale, that means every connected user feels a stutter at the same time. There's no way around it — it's baked into how Go manages memory.
 
-**Read State Service** — Tracks the last message each user has read in each channel. This
-is the exact service Discord rewrote. Instead of writing to the database on every read
-acknowledgment, it buffers updates in memory and flushes them in bulk every 5 seconds.
+Rust doesn't have this problem. There's no GC. When a message finishes being delivered, the memory is freed right there, instantly. No pile-up, no scanning, no pauses.
+
+**Where in the code:** This isn't one file — it's a property of the entire codebase. Every function, every struct, every temporary variable gets cleaned up the moment it goes out of scope.
+
+### 2. Thousands of users fighting for one lock
+
+A regular HashMap with a lock means everyone waits in line. User #3847 wants to read, but user #12 is writing, so 3846 users just sit there.
+
+I used DashMap — it splits the data into 64 independent segments. Alice's connection lives on segment #12, Bob's on segment #47. They never block each other.
+
+**Where in the code:** `src/gateway/session.rs`
+
+### 3. Hitting the database on every message
+
+When someone sends a message to a channel with 100 members, I need to know who those 100 members are. Querying the database every single time is wasteful — at 1000 messages per second, that's 1000 identical queries.
+
+So I cache the member list. First message triggers a DB query. The next 999 hit the cache. It expires after 5 minutes and refreshes.
+
+**Where in the code:** `src/router/fanout.rs`
+
+### 4. Presence status flickers on bad connections
+
+Your phone goes through a tunnel. WiFi drops for 2 seconds. Without handling this, everyone in your servers sees "offline" then "online" — two broadcasts to potentially 50,000 users for a 2-second blip.
+
+I added a 5-second debounce. When someone disconnects, I start a timer. If they come back within 5 seconds, the timer cancels silently. Nobody gets notified. If they don't come back, then I broadcast offline.
+
+**Where in the code:** `src/presence/tracker.rs`
+
+### 5. One status change triggers 50,000 notifications
+
+If you're in 50 servers with 1000 members each, going online means notifying 50,000 people. If 10 users come online in the same second, that's half a million notifications.
+
+I batch these. Every 100 milliseconds, I collect all the status changes that happened, remove duplicates (if you share 3 servers with someone, they get notified once, not three times), and send everything in one burst.
+
+**Where in the code:** `src/presence/broadcast.rs`
+
+### 6. Millions of database writes per second
+
+Every time you open a channel, your app says "I've read up to message #X." At scale, that's millions of these acknowledgments per second. Writing each one to the database individually would melt it.
+
+This is the exact service Discord rewrote. My approach: buffer everything in memory (takes microseconds), then flush to the database in one bulk query every 5 seconds. 50,000 individual writes become a handful of batch inserts.
+
+The flush runs on a completely separate task. It never blocks message delivery. Think of it like a restaurant — the waiter keeps serving tables while the dishwasher collects plates in the back every few minutes.
+
+**Where in the code:** `src/readstate/cache.rs`
+
+### 7. Dead connections eating memory forever
+
+Someone closes their laptop without disconnecting. Their session just goes silent. Without cleanup, thousands of these zombie sessions pile up over time, wasting memory and confusing the presence system.
+
+A background task checks every 10 seconds. If a connection hasn't sent anything in 60 seconds, it gets reaped. In Rust, the memory is freed the instant the session is removed — no waiting for a GC cycle.
+
+**Where in the code:** `src/gateway/heartbeat.rs`
 
 ---
 
-## Prerequisites
+## Demo — see it working
 
-You need 3 things installed:
+Here's what it looks like when you run the system and connect two users.
 
-### 1. Rust
-
-**Windows:** Download from https://www.rust-lang.org/tools/install — run `rustup-init.exe`.
-
-**Mac/Linux:**
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-Restart your terminal after installing, then verify:
+### Starting the server
 
 ```
-rustc --version
-cargo --version
+$ cargo run
+
+Starting RustRelay gateway node_id="node-1"
+Connected to PostgreSQL
+Redis publisher connected node_id="node-1"
+Redis subscriber listening node_id="node-1"
+Metrics server listening addr=0.0.0.0:9090
+Gateway server listening addr=0.0.0.0:8080
 ```
 
-### 2. PostgreSQL
+### Alice connects
 
-**Windows:** Download from https://www.enterprisedb.com/downloads/postgres-postgresql-downloads
+```
+$ websocat ws://127.0.0.1:8080/ws
+token_alice
 
-Pick version 16 for Windows. During installation:
-- Set password to `password` (or anything you'll remember)
-- Keep port as `5432`
-- Only check "PostgreSQL Server" and "Command Line Tools"
-- Uncheck pgAdmin and Stack Builder (you don't need them)
-- When Stack Builder pops up after install, click Cancel
-
-**Mac:**
-```bash
-brew install postgresql@16
-brew services start postgresql@16
+{"t":"READY","d":{
+  "session_id":"f04e6fbf-...",
+  "user":{"id":"00000000-...0001","username":"alice"},
+  "guilds":[{
+    "name":"RustRelay Dev",
+    "channels":[
+      {"name":"general"},
+      {"name":"random"}
+    ],
+    "member_count":4
+  }],
+  "heartbeat_interval_ms":30000
+}}
 ```
 
-**Linux:**
-```bash
-sudo apt install postgresql postgresql-client -y
-sudo systemctl start postgresql
+### Alice sends a message — Bob receives it instantly
+
+Alice types:
+
+```
+{"op":"send_message","d":{"channel_id":"20000000-...0001","content":"Hey Bob!"}}
 ```
 
-### 3. Redis (or Memurai on Windows)
+Bob's terminal (separate connection) immediately shows:
 
-**Windows:** Redis doesn't run on Windows natively. Install Memurai instead — it's a
-drop-in replacement that works exactly the same:
-
-Download from https://www.memurai.com/get-memurai — install with all defaults.
-It starts automatically on port 6379.
-
-**Mac:**
-```bash
-brew install redis
-brew services start redis
+```
+{"t":"MESSAGE_CREATE","d":{
+  "content":"Hey Bob!",
+  "author_id":"00000000-...0001",
+  "channel_id":"20000000-...0001",
+  "timestamp":"2026-03-22T19:22:10Z"
+}}
 ```
 
-**Linux:**
-```bash
-sudo apt install redis-server -y
-sudo systemctl start redis-server
+Server log confirms:
+
+```
+Message routed latency_ms=3 channel_id=20000000-...
 ```
 
-### 4. websocat (for testing)
+3 milliseconds. No GC spike. Every single message, consistently.
+
+### Bob disconnects — presence debounce kicks in
+
+Bob closes his terminal. Five seconds of silence pass. Then Alice sees:
+
+```
+{"t":"PRESENCE_UPDATE","d":{"user_id":"00000000-...0002","status":"offline"}}
+```
+
+That 5-second gap is the debounce. If Bob had reconnected within those 5 seconds, Alice would have seen nothing — zero wasted traffic.
+
+### Heartbeat keeps connections alive
+
+```
+{"op":"heartbeat","d":{"seq":1}}
+
+{"t":"HEARTBEAT_ACK","d":{"seq":1}}
+```
+
+If a client stops sending heartbeats for 60 seconds, the server reaps the connection and frees the memory instantly.
+
+### Server stats
+
+```
+$ curl http://localhost:8080/api/stats
+
+{
+  "node_id": "node-1",
+  "active_connections": 2,
+  "readstate_pending": 0,
+  "readstate_total_ops": 5
+}
+```
+
+### Prometheus metrics
+
+```
+$ curl http://localhost:9090/metrics
+
+messages_routed_total 12
+active_connections 2
+message_fanout_duration_seconds_bucket{le="0.005"} 11
+presence_updates_broadcast 3
+readstate_flushed_total 5
+```
+
+---
+
+## What's in the box
+
+```
+src/
+├── main.rs                 Wires everything together
+├── config.rs               Reads settings from .env
+├── models.rs               Data types + WebSocket protocol
+├── auth.rs                 JWT + simple token auth
+├── db.rs                   All PostgreSQL queries
+├── error.rs                Error handling
+├── routes.rs               REST API + WebSocket upgrade
+├── ratelimit.rs            Token bucket rate limiter (hand-built)
+├── metrics.rs              Prometheus metrics
+│
+├── gateway/
+│   ├── session.rs          Session store — DashMap + mpsc channels
+│   ├── handler.rs          WebSocket lifecycle
+│   └── heartbeat.rs        Reaps dead connections
+│
+├── router/
+│   ├── fanout.rs           Message delivery + member cache
+│   └── redis_bridge.rs     Cross-server delivery via Redis
+│
+├── presence/
+│   ├── tracker.rs          Debounced offline detection
+│   └── broadcast.rs        Batched status notifications
+│
+└── readstate/
+    └── cache.rs            Write buffer + bulk flush
+```
+
+---
+
+## How a message travels through the code
+
+```
+Alice sends "Hey everyone!"
+       │
+       ▼
+gateway/handler.rs       → receives WebSocket message, parses it
+       │
+       ▼
+router/fanout.rs         → the brain of delivery
+       ├── db.rs             save to PostgreSQL
+       ├── DashMap cache     look up channel members (cached)
+       ├── session.rs        push to each member's channel
+       └── redis_bridge.rs   publish to Redis for other servers
+```
+
+---
+
+## Requirements
+
+| What             | Why                                             |
+| ---------------- | ----------------------------------------------- |
+| Rust 1.75+       | The language. Install from https://rustup.rs    |
+| PostgreSQL 16    | Stores messages, users, guilds, channels        |
+| Redis or Memurai | Pub/sub for cross-server messaging and presence |
+| websocat         | Command-line WebSocket client for testing       |
+
+### Installing on Windows
+
+**Rust:**
+Download and run `rustup-init.exe` from https://www.rust-lang.org/tools/install
+
+**PostgreSQL:**
+Download from https://www.enterprisedb.com/downloads/postgres-postgresql-downloads — pick version 16. During install, only check PostgreSQL Server and Command Line Tools.
+
+**Redis:**
+Download the MSI from https://github.com/tporadowski/redis/releases — install with defaults. Or install Memurai from https://www.memurai.com/get-memurai
+
+**websocat:**
 
 ```
 cargo install websocat
 ```
 
-Takes a few minutes to compile. This gives you a command-line WebSocket client.
+### Installing on Mac
+
+```bash
+brew install postgresql@16 redis
+brew services start postgresql@16
+brew services start redis
+cargo install websocat
+```
+
+### Installing on Linux
+
+```bash
+sudo apt install postgresql redis-server -y
+sudo systemctl start postgresql redis-server
+cargo install websocat
+```
 
 ---
 
-## Setup
+## Setting it up
 
-### Option A: Automatic setup (Windows)
+### Database setup
 
-Open a terminal in the project folder and run:
-
-```
-scripts\setup_windows.bat
-```
-
-This creates the database, user, tables, and test data automatically.
-Then skip ahead to "Configure and Run" below.
-
-### Option B: Manual setup (all platforms)
-
-**Step 1: Create the database and user.**
-
-Windows (adjust the path to where you installed PostgreSQL):
-```powershell
-& "C:\Program Files\PostgreSQL\16\bin\psql.exe" -U postgres
-```
-
-Mac/Linux:
-```bash
-psql -U postgres
-```
-
-Type your PostgreSQL password, then run these 3 commands:
+Connect to PostgreSQL and create the database:
 
 ```sql
 CREATE USER rustrelay WITH PASSWORD 'password';
 CREATE DATABASE rustrelay OWNER rustrelay;
-\q
 ```
 
-**Step 2: Load the tables and test data.**
+Load the tables:
 
 Windows:
+
 ```powershell
 & "C:\Program Files\PostgreSQL\16\bin\psql.exe" -U rustrelay -d rustrelay -f migrations\001_initial.sql
 ```
 
 Mac/Linux:
+
 ```bash
 psql -U rustrelay -d rustrelay -f migrations/001_initial.sql
 ```
 
-Type `password` when asked. If you see the INSERT statements run with no errors, the
-database is ready.
+### Configuration
 
-### Option C: Docker (if you have it)
-
-If you have Docker installed, this is the quickest way:
-
-```bash
-docker compose up -d
-```
-
-This starts PostgreSQL and Redis with all tables and test data pre-loaded.
-Wait 10 seconds, then check both show "healthy":
-
-```bash
-docker compose ps
-```
-
----
-
-## Configure and Run
-
-**Step 1: Create the config file.**
-
-Windows:
-```powershell
-copy .env.example .env
-```
-
-Mac/Linux:
 ```bash
 cp .env.example .env
 ```
 
-**Step 2: Edit `.env` in VS Code or any editor.**
+Open `.env` and set:
 
-Change this line:
 ```
-JWT_SECRET=change-me-to-a-long-random-string
-```
-To:
-```
-JWT_SECRET=mysecret123
+DATABASE_URL=postgres://rustrelay:password@localhost:5432/rustrelay
+REDIS_URL=redis://localhost:6379
+JWT_SECRET=anyrandomstringhere
 ```
 
-If you installed PostgreSQL with a different password, also update:
-```
-DATABASE_URL=postgres://rustrelay:YOUR_PASSWORD_HERE@localhost:5432/rustrelay
-```
-
-Save the file.
-
-**Step 3: Run the server.**
+### Running
 
 ```
 cargo run
 ```
 
-First build takes 2-5 minutes (downloading dependencies). When ready, you'll see:
-
-```
-Starting RustRelay gateway node_id="node-1"
-Connected to PostgreSQL
-Redis publisher connected
-Redis subscriber listening
-Metrics server listening addr=0.0.0.0:9090
-Gateway server listening addr=0.0.0.0:8080
-```
-
-All 6 lines = everything is working. Keep this terminal open.
-
-**Step 4: Verify.**
-
-Open a new terminal:
-
-```
-curl http://localhost:8080/api/health
-```
-
-Should print `OK`.
-
-```
-curl http://localhost:8080/api/stats
-```
-
-Should print JSON with `node_id`, `active_connections`, etc.
+First build takes a few minutes. After that it's instant. You'll see 6 startup lines ending with `Gateway server listening`.
 
 ---
 
-## Testing it out
+## Test users
 
-### Connect as Alice
+Comes pre-loaded with 4 users in one guild with 2 channels:
 
-Open a new terminal:
+| User    | Token           |
+| ------- | --------------- |
+| alice   | `token_alice`   |
+| bob     | `token_bob`     |
+| charlie | `token_charlie` |
+| dave    | `token_dave`    |
 
-```
-websocat ws://127.0.0.1:8080/ws
-```
-
-Cursor blinks. Type and press Enter:
-
-```
-token_alice
-```
-
-You'll receive a `READY` event with Alice's session info, guilds, and channels.
-
-### Connect as Bob
-
-Open another terminal:
-
-```
-websocat ws://127.0.0.1:8080/ws
-```
-
-Type:
-
-```
-token_bob
-```
-
-### Send a message
-
-In Alice's terminal, type:
-
-```json
-{"op":"send_message","d":{"channel_id":"20000000-0000-0000-0000-000000000001","content":"Hey Bob!"}}
-```
-
-**What to check:**
-- Alice sees a `MESSAGE_CREATE` event (she gets her own message back)
-- Bob sees the same `MESSAGE_CREATE` event (message was delivered to him)
-- Server logs show `Message routed latency_ms=3` (delivered in ~3ms, no GC pause)
-
-### Test heartbeat
-
-In any connected terminal:
-
-```json
-{"op":"heartbeat","d":{"seq":1}}
-```
-
-You'll get back `HEARTBEAT_ACK` with the same seq number.
-
-### Test presence
-
-Close Bob's terminal (Ctrl+C). Wait 5 seconds. Alice receives:
-
-```json
-{"t":"PRESENCE_UPDATE","d":{"user_id":"...","status":"offline"}}
-```
-
-The 5-second wait is the debounce. Reconnect Bob and Alice sees `"status":"online"`.
-
-### Test typing indicator
-
-In Alice's terminal:
-
-```json
-{"op":"start_typing","d":{"channel_id":"20000000-0000-0000-0000-000000000001"}}
-```
-
-Bob sees `TYPING_START`. Alice doesn't see it (you don't see your own typing).
+Channels: `#general` and `#random`
 
 ---
 
-## Verification checklist
+## WebSocket commands
 
-```
-[ ] cargo run shows all 6 startup lines
-[ ] curl /api/health returns "OK"
-[ ] curl /api/stats returns JSON
-[ ] Alice connects and gets READY
-[ ] Bob connects and gets READY
-[ ] Alice sends message → both receive it
-[ ] Server log shows latency_ms under 10
-[ ] Heartbeat returns HEARTBEAT_ACK
-[ ] Close Bob → Alice sees offline after 5s
-[ ] Reopen Bob → Alice sees online
-[ ] curl localhost:9090/metrics returns Prometheus data
+**Send a message:**
+
+```json
+{
+  "op": "send_message",
+  "d": {
+    "channel_id": "20000000-0000-0000-0000-000000000001",
+    "content": "Hello!"
+  }
+}
 ```
 
----
+**Mark as read:**
 
-## Available test users
+```json
+{
+  "op": "ack_message",
+  "d": {
+    "channel_id": "20000000-0000-0000-0000-000000000001",
+    "message_id": "..."
+  }
+}
+```
 
-| Username | Token | User ID |
-|----------|-------|---------|
-| alice | `token_alice` | `00000000-...-000000000001` |
-| bob | `token_bob` | `00000000-...-000000000002` |
-| charlie | `token_charlie` | `00000000-...-000000000003` |
-| dave | `token_dave` | `00000000-...-000000000004` |
+**Heartbeat:**
 
-All 4 are in the "RustRelay Dev" guild with 2 channels:
-- `#general` — `20000000-0000-0000-0000-000000000001`
-- `#random` — `20000000-0000-0000-0000-000000000002`
+```json
+{ "op": "heartbeat", "d": { "seq": 1 } }
+```
 
----
+**Set status:**
 
-## WebSocket protocol
+```json
+{ "op": "update_presence", "d": { "status": "dnd" } }
+```
 
-### What the client sends
+**Typing indicator:**
 
-| Operation | Example |
-|-----------|---------|
-| Send a message | `{"op":"send_message","d":{"channel_id":"...","content":"Hello!"}}` |
-| Mark as read | `{"op":"ack_message","d":{"channel_id":"...","message_id":"..."}}` |
-| Update status | `{"op":"update_presence","d":{"status":"dnd"}}` |
-| Keep alive | `{"op":"heartbeat","d":{"seq":1}}` |
-| Typing | `{"op":"start_typing","d":{"channel_id":"..."}}` |
-
-### What the server sends
-
-| Event | When |
-|-------|------|
-| `READY` | Right after authentication |
-| `MESSAGE_CREATE` | Someone sent a message in a channel you're in |
-| `MESSAGE_UPDATE` | A message was edited |
-| `MESSAGE_DELETE` | A message was deleted |
-| `PRESENCE_UPDATE` | A user in your guild went online/offline/idle/dnd |
-| `TYPING_START` | Someone started typing |
-| `HEARTBEAT_ACK` | Server acknowledges your heartbeat |
+```json
+{
+  "op": "start_typing",
+  "d": { "channel_id": "20000000-0000-0000-0000-000000000001" }
+}
+```
 
 ---
 
 ## REST API
 
-| Method | Path | What it does |
-|--------|------|-------------|
-| GET | `/api/health` | Returns "OK" if the server is running |
-| POST | `/api/login` | Get a JWT token |
-| GET | `/api/guilds/:id/channels` | List channels in a guild |
-| GET | `/api/channels/:id/messages` | Get recent messages |
-| POST | `/api/channels/:id/messages` | Send a message via REST |
-| GET | `/api/stats` | Server statistics |
-| GET | `:9090/metrics` | Prometheus metrics |
-
----
-
-## Project structure
-
-```
-rustrelay/
-├── src/
-│   ├── main.rs                 Entry point — wires everything together
-│   ├── lib.rs                  Module declarations
-│   ├── config.rs               Reads settings from .env file
-│   ├── models.rs               All data types + WebSocket protocol
-│   ├── auth.rs                 JWT tokens + simple token auth for dev
-│   ├── db.rs                   Every SQL query lives here
-│   ├── error.rs                Error types with proper HTTP status codes
-│   ├── routes.rs               REST endpoints + WebSocket upgrade
-│   ├── ratelimit.rs            Token bucket rate limiter (hand-built)
-│   ├── metrics.rs              Prometheus metric definitions
-│   │
-│   ├── gateway/                 ← Problem 1, 2, 7
-│   │   ├── session.rs          DashMap session store (64 shards, mpsc per user)
-│   │   ├── handler.rs          WebSocket lifecycle
-│   │   └── heartbeat.rs        Reaps dead sessions every 10 seconds
-│   │
-│   ├── router/                  ← Problem 3
-│   │   ├── fanout.rs           Message routing with cached member lookup
-│   │   └── redis_bridge.rs     Redis pub/sub for cross-server delivery
-│   │
-│   ├── presence/                ← Problem 4, 5
-│   │   ├── tracker.rs          Debounced offline (5s timer with cancel)
-│   │   └── broadcast.rs        Batched + de-duplicated fan-out
-│   │
-│   └── readstate/               ← Problem 6 (the Discord rewrite)
-│       └── cache.rs            DashMap buffer → bulk flush every 5 seconds
-│
-├── migrations/
-│   └── 001_initial.sql          Schema + test data
-│
-├── tests/
-│   └── gateway_integration.rs   End-to-end WebSocket tests
-│
-├── benches/
-│   └── fanout.rs                Performance benchmarks
-│
-├── scripts/
-│   ├── setup_windows.bat        Automatic Windows setup (no Docker)
-│   └── load_test.sh             Stress test with concurrent clients
-│
-├── docker-compose.yml           PostgreSQL + Redis (optional, if you have Docker)
-├── Dockerfile                   Production build (optional)
-├── Cargo.toml                   Dependencies
-├── .env.example                 Configuration template
-└── .gitignore
-```
-
----
-
-## How it all connects
-
-When Alice sends "Hey everyone!":
-
-```
-Alice's browser
-    │
-    ▼
-gateway/handler.rs          Receives WebSocket message, parses JSON
-    │
-    ▼
-router/fanout.rs            The brain:
-    ├──→ db.rs              Step 1: Save message to PostgreSQL
-    ├──→ DashMap cache      Step 2: Look up channel members (cached)
-    ├──→ session.rs         Step 3: Push to each member's mpsc channel
-    └──→ redis_bridge.rs    Step 4: Publish to Redis for other servers
-```
-
-When Bob reads the message:
-
-```
-Bob sends ack_message
-    │
-    ▼
-readstate/cache.rs          Writes to DashMap (0.001ms)
-    │
-    ... 5 seconds pass ...
-    │
-    ▼
-db.rs                       One bulk INSERT for all buffered acks
-```
-
-When Charlie disconnects:
-
-```
-WebSocket closes
-    │
-    ▼
-presence/tracker.rs         Starts 5-second debounce timer
-    │
-    ... 5 seconds, no reconnect ...
-    │
-    ▼
-presence/broadcast.rs       Batches the update, broadcasts
-```
+| Method | Path                         | What it does       |
+| ------ | ---------------------------- | ------------------ |
+| GET    | `/api/health`                | Health check       |
+| POST   | `/api/login`                 | Get a JWT token    |
+| GET    | `/api/guilds/:id/channels`   | List channels      |
+| GET    | `/api/channels/:id/messages` | Get messages       |
+| POST   | `/api/channels/:id/messages` | Send a message     |
+| GET    | `/api/stats`                 | Server statistics  |
+| GET    | `:9090/metrics`              | Prometheus metrics |
 
 ---
 
 ## Running multiple servers
 
 ```bash
-NODE_ID=node-1 PORT=8080 cargo run
-NODE_ID=node-2 PORT=8081 cargo run
+NODE_ID=node-1 PORT=8080 cargo run    # terminal 1
+NODE_ID=node-2 PORT=8081 cargo run    # terminal 2
 ```
 
-Both share state through Redis. Alice on node-1 can message Bob on node-2.
-
----
-
-## Running tests
-
-```
-cargo check
-cargo test
-cargo bench
-```
-
----
-
-## Stopping everything
-
-```
-Ctrl+C in the cargo run terminal
-
-Windows — stop PostgreSQL:
-  net stop postgresql-x64-16
-
-Windows — stop Memurai:
-  net stop memurai
-
-If using Docker instead:
-  docker compose down
-```
-
----
-
-## Troubleshooting
-
-| Problem | Fix |
-|---------|-----|
-| "Connection refused" on cargo run | PostgreSQL or Redis/Memurai isn't running |
-| "password authentication failed" | Check DATABASE_URL in .env matches your PostgreSQL password |
-| "Invalid token" on websocat | Type exactly `token_alice` — no quotes, no spaces |
-| Build fails "linker not found" | Install Visual Studio Build Tools: https://visualstudio.microsoft.com/visual-cpp-build-tools/ |
-| Port 8080 in use | Change `PORT=8081` in `.env` |
-| "database does not exist" | Run the setup script or create manually (see Setup section) |
-| psql not found | Use full path: `& "C:\Program Files\PostgreSQL\16\bin\psql.exe" -U postgres` |
-| Memurai not starting | Open Services (Win+R → services.msc) → find Memurai → Start |
+Alice connects to node-1, Bob connects to node-2. When Alice sends a message, node-1 publishes to Redis, node-2 picks it up and delivers to Bob. The servers don't need to know about each other.
 
 ---
 
 ## Tech stack
 
-| Tool | Why |
-|------|-----|
-| Tokio | Async runtime — thousands of tasks on a few threads |
-| axum | Web framework with native WebSocket support |
-| DashMap | Concurrent hash map — 64 shards, near-zero lock contention |
-| sqlx | Async PostgreSQL with compile-time query checking |
-| fred | Redis client with pub/sub support |
-| serde | Fast JSON serialization |
-| tracing | Structured logging |
-| metrics | Prometheus-compatible tracking |
+| Tool    | Purpose                       |
+| ------- | ----------------------------- |
+| Tokio   | Async runtime                 |
+| axum    | HTTP + WebSocket server       |
+| DashMap | Lock-free concurrent hash map |
+| sqlx    | Async PostgreSQL              |
+| redis   | Pub/sub for scaling           |
+| serde   | JSON handling                 |
+| tracing | Structured logging            |
+| metrics | Prometheus integration        |
 
 ---
 
