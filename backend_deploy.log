@@ -1,0 +1,48 @@
+﻿=== RustRelay Backend Deploy ===
+Step 1: Checking Git...
+Git: git version 2.53.0.windows.2
+
+Step 2: Initializing git repo...
+No changes to commit.
+
+Step 3: Checking GitHub CLI (gh)...
+GitHub CLI: 
+
+Step 4: Checking GitHub auth...
+GitHub: authenticated
+
+Step 5: Creating GitHub repo (rustrelay)...
+Repo already exists. Pushing...
+git : Everything up-to-date
+At D:\rustrelay\deploy_backend.ps1:90 char:5
++     git push -u origin main 2>&1 | ForEach-Object { Log $_ }
++     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Everything up-to-date:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+branch 'main' set up to track 'origin/main'.
+Pushed to GitHub.
+
+Step 6: Checking flyctl...
+flyctl: 
+
+Step 7: Fly.io auth...
+Fly.io: 
+
+Step 8: Creating Fly.io app and PostgreSQL...
+Creating app rustrelay-demo...
+
+Creating PostgreSQL cluster (rustrelay-db)...
+
+Attaching PostgreSQL to app...
+
+Step 9: Setting secrets...
+
+Step 10: Deploying to Fly.io (Docker build takes about 5 min the first time)...
+
+=== DEPLOYMENT COMPLETE ===
+Backend live at:   https://rustrelay-demo.fly.dev
+WebSocket URL:     wss://rustrelay-demo.fly.dev/ws
+
+Next: double-click run_update_frontend.vbs to wire up the Vercel site.
+Full log: D:\rustrelay\backend_deploy.log
