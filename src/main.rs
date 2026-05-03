@@ -59,10 +59,15 @@ async fn main() -> anyhow::Result<()> {
     // Run database migrations (creates tables if they don't exist).
     sqlx::migrate!("./migrations").run(&pool).await.ok();
 
-    // ── Connect to Redis ────────────────────────────────────
-    let redis = Arc::new(
-        RedisBridge::new(&config.redis_url, config.node_id.clone()).await?,
-    );
+    // ── Connect to Redis (optional) ─────────────────────────
+    // If REDIS_URL is unset or empty, the bridge runs in disabled mode:
+    // all cross-node pub/sub calls become silent no-ops. This lets
+    // the server run as a standalone node without Redis (single-node demo).
+    let redis = Arc::new(if config.redis_url.is_empty() {
+        RedisBridge::new_disabled(config.node_id.clone())
+    } else {
+        RedisBridge::new(&config.redis_url, config.node_id.clone()).await?
+    });
 
     // ── Create the session store (Problem #2) ───────────────
     // DashMap with 64 shards. All sessions live here.

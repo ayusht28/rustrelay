@@ -6,16 +6,17 @@ use std::sync::Arc;
 
 /// Handles Redis pub/sub for cross-node event delivery.
 ///
-/// Each gateway node subscribes to `gateway:{node_id}` and a global
-/// broadcast channel. When a message needs to reach a user on a
-/// different node, the originating node publishes to the global channel
-/// and each node checks if it has the target users locally.
+/// When REDIS_URL is empty, the bridge runs in **disabled** mode:
+/// all publish/subscribe operations become silent no-ops, so the
+/// server works as a single-node deployment without Redis.
 pub struct RedisBridge {
-    publisher: RedisClient,
+    publisher: Option<RedisClient>,
     node_id: String,
+    disabled: bool,
 }
 
 impl RedisBridge {
+    /// Connect to Redis and return a live bridge.
     pub async fn new(redis_url: &str, node_id: String) -> anyhow::Result<Self> {
         let config = RedisConfig::from_url(redis_url)?;
         let publisher = RedisClient::new(config, None, None, None);
@@ -25,16 +26,34 @@ impl RedisBridge {
         tracing::info!(node_id = %node_id, "Redis publisher connected");
 
         Ok(Self {
-            publisher,
+            publisher: Some(publisher),
             node_id,
+            disabled: false,
         })
+    }
+
+    /// Create a no-op bridge — used when REDIS_URL is empty.
+    /// All publish/set/get calls succeed instantly without doing anything.
+    pub fn new_disabled(node_id: String) -> Self {
+        tracing::info!(
+            node_id = %node_id,
+            "Redis disabled — running in single-node mode (no cross-node delivery)"
+        );
+        Self {
+            publisher: None,
+            node_id,
+            disabled: true,
+        }
     }
 
     /// Publish an event for cross-node delivery.
     pub async fn publish_event(&self, payload: CrossNodePayload) -> anyhow::Result<()> {
+        if self.disabled {
+            return Ok(());
+        }
+        let publisher = self.publisher.as_ref().unwrap();
         let json = serde_json::to_string(&payload)?;
-        let _: () = self
-            .publisher
+        let _: () = publisher
             .publish("rustrelay:events", json.as_str())
             .await?;
         metrics::counter!("redis_messages_published").increment(1);
@@ -47,13 +66,16 @@ impl RedisBridge {
         user_id: UserId,
         status: PresenceStatus,
     ) -> anyhow::Result<()> {
+        if self.disabled {
+            return Ok(());
+        }
+        let publisher = self.publisher.as_ref().unwrap();
         let payload = serde_json::json!({
             "source_node": self.node_id,
             "user_id": user_id,
             "status": status,
         });
-        let _: () = self
-            .publisher
+        let _: () = publisher
             .publish("rustrelay:presence", payload.to_string().as_str())
             .await?;
         Ok(())
@@ -66,6 +88,10 @@ impl RedisBridge {
         status: PresenceStatus,
         ttl_secs: i64,
     ) -> anyhow::Result<()> {
+        if self.disabled {
+            return Ok(());
+        }
+        let publisher = self.publisher.as_ref().unwrap();
         let key = format!("presence:{user_id}");
         let value = serde_json::json!({
             "status": status,
@@ -74,8 +100,7 @@ impl RedisBridge {
         })
         .to_string();
 
-        let _: () = self
-            .publisher
+        let _: () = publisher
             .set(
                 key.as_str(),
                 value.as_str(),
@@ -89,15 +114,23 @@ impl RedisBridge {
 
     /// Get a user's presence from Redis.
     pub async fn get_presence(&self, user_id: UserId) -> anyhow::Result<Option<String>> {
+        if self.disabled {
+            return Ok(None);
+        }
+        let publisher = self.publisher.as_ref().unwrap();
         let key = format!("presence:{user_id}");
-        let result: Option<String> = self.publisher.get(key.as_str()).await?;
+        let result: Option<String> = publisher.get(key.as_str()).await?;
         Ok(result)
     }
 
     /// Remove a user's presence key.
     pub async fn remove_presence(&self, user_id: UserId) -> anyhow::Result<()> {
+        if self.disabled {
+            return Ok(());
+        }
+        let publisher = self.publisher.as_ref().unwrap();
         let key = format!("presence:{user_id}");
-        let _: () = self.publisher.del(key.as_str()).await?;
+        let _: () = publisher.del(key.as_str()).await?;
         Ok(())
     }
 
@@ -109,11 +142,17 @@ impl RedisBridge {
 
 /// Spawn a subscriber task that listens on `rustrelay:events` and
 /// delivers messages to local sessions.
+/// If redis_url is empty, returns immediately (no-op).
 pub async fn spawn_subscriber(
     redis_url: &str,
     node_id: String,
     sessions: Arc<SessionStore>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    if redis_url.is_empty() {
+        tracing::info!(node_id = %node_id, "Redis subscriber disabled");
+        return Ok(tokio::spawn(async {}));
+    }
+
     let config = RedisConfig::from_url(redis_url)?;
     let subscriber = RedisClient::new(config, None, None, None);
     subscriber.connect();

@@ -31,7 +31,8 @@ impl Config {
                 format!("node-{}", uuid::Uuid::new_v4().as_simple())
             }),
             database_url: env::var("DATABASE_URL")?,
-            redis_url: env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into()),
+            // Empty string = disabled (single-node mode, no cross-node pub/sub)
+            redis_url: env::var("REDIS_URL").unwrap_or_default(),
             jwt_secret: env::var("JWT_SECRET")?,
             heartbeat_interval: Duration::from_secs(
                 env::var("HEARTBEAT_INTERVAL_SECS")

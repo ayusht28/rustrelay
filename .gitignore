@@ -17,3 +17,6 @@ desktop.ini
 
 # Logs
 *.log
+
+# Vercel
+.vercel/

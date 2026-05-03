@@ -1,0 +1,49 @@
+# Fly.io deployment config for RustRelay
+# Free tier: 3 shared-cpu-1x VMs + free PostgreSQL
+# Deploy with: flyctl deploy
+
+app = "rustrelay-demo"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  HOST = "0.0.0.0"
+  PORT = "8080"
+  NODE_ID = "node-fly-1"
+  REDIS_URL = ""
+  RUST_LOG = "rustrelay=info"
+  HEARTBEAT_INTERVAL_SECS = "30"
+  HEARTBEAT_TIMEOUT_SECS = "3600"
+  PRESENCE_OFFLINE_DEBOUNCE_SECS = "5"
+  READSTATE_FLUSH_INTERVAL_SECS = "5"
+  READSTATE_FLUSH_BATCH_SIZE = "1000"
+  CHANNEL_MEMBER_CACHE_TTL_SECS = "300"
+  METRICS_PORT = "9090"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 200
+    soft_limit = 150
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+[checks]
+  [checks.health]
+    grace_period = "30s"
+    interval = "15s"
+    method = "get"
+    path = "/api/health"
+    protocol = "http"
+    timeout = "10s"
+    type = "http"
