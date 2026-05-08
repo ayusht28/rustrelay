@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
+use reqwest::Client;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -49,15 +50,30 @@ async fn main() -> anyhow::Result<()> {
     app_metrics::describe_metrics();
 
     // ── Connect to PostgreSQL ───────────────────────────────
+    // Use connect_lazy so the server starts immediately even if the DB
+    // is waking up (common on free-tier Neon / Render Postgres).
     let pool = PgPoolOptions::new()
-        .max_connections(50)
-        .acquire_timeout(Duration::from_secs(5))
-        .connect(&config.database_url)
-        .await?;
-    tracing::info!("Connected to PostgreSQL");
+        .max_connections(20) // free-tier Postgres typically caps at 25
+        .acquire_timeout(Duration::from_secs(30))
+        .connect_lazy(&config.database_url)?;
+    tracing::info!("PostgreSQL pool created (lazy connect)");
 
-    // Run database migrations (creates tables if they don't exist).
-    sqlx::migrate!("./migrations").run(&pool).await.ok();
+    // Run migrations in a background task with retries so we don't block
+    // server startup while the database is waking up.
+    {
+        let pool_m = pool.clone();
+        tokio::spawn(async move {
+            for attempt in 1u32..=5 {
+                match sqlx::migrate!("./migrations").run(&pool_m).await {
+                    Ok(_) => { tracing::info!("Database migrations applied"); break; }
+                    Err(e) => {
+                        tracing::warn!(attempt, error = %e, "Migration failed, retrying...");
+                        tokio::time::sleep(Duration::from_secs(u64::from(attempt) * 3)).await;
+                    }
+                }
+            }
+        });
+    }
 
     // ── Connect to Redis (optional) ─────────────────────────
     // If REDIS_URL is unset or empty, the bridge runs in disabled mode:
@@ -145,6 +161,32 @@ async fn main() -> anyhow::Result<()> {
     // ── Start the Prometheus metrics server (port 9090) ─────
     let metrics_addr = config.metrics_addr();
     tokio::spawn(app_metrics::serve_metrics(metrics_addr, prom_handle));
+
+    // ── Keep-alive ping (Render free tier stays awake) ───────
+    // Render free web services sleep after 15 min of inactivity.
+    // We ping our own public URL every 10 minutes so the service
+    // always looks active to Render's inactivity monitor.
+    if let Ok(render_url) = std::env::var("RENDER_EXTERNAL_URL") {
+        if !render_url.is_empty() {
+            let ping_url = format!("{}/api/health", render_url);
+            tracing::info!(url = %ping_url, "Keep-alive pinger enabled");
+            tokio::spawn(async move {
+                let client = Client::builder()
+                    .timeout(Duration::from_secs(10))
+                    .build()
+                    .expect("keep-alive HTTP client");
+                let mut interval = tokio::time::interval(Duration::from_secs(10 * 60));
+                interval.tick().await; // skip the immediate first tick
+                loop {
+                    interval.tick().await;
+                    match client.get(&ping_url).send().await {
+                        Ok(_)  => tracing::debug!("Keep-alive ping OK"),
+                        Err(e) => tracing::warn!(error = %e, "Keep-alive ping failed"),
+                    }
+                }
+            });
+        }
+    }
 
     // ── Start the main HTTP + WebSocket server ──────────────
     let listen_addr = config.listen_addr();
